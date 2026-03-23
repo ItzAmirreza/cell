@@ -1,0 +1,16 @@
+[package]
+name = "cell-store"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cell-format = { path = "../cell-format" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

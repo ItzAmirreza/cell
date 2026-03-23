@@ -1,0 +1,34 @@
+[package]
+name = "cell-runtime"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cell-format = { path = "../cell-format" }
+cell-store = { path = "../cell-store" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dirs = "5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = [
+    "sched",
+    "mount",
+    "hostname",
+    "process",
+    "signal",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_Foundation",
+    "Win32_Security",
+] }

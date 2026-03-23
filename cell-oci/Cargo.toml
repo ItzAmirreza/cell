@@ -1,0 +1,16 @@
+[package]
+name = "cell-oci"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+cell-format = { path = "../cell-format" }
+cell-store = { path = "../cell-store" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+dirs = "5"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+flate2 = "1"
+tar = "0.4"

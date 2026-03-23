@@ -1,0 +1,22 @@
+# Example Cellfile — the declarative container format for Cell.
+#
+# This replaces Dockerfiles with a typed, composable format.
+# No imperative shell commands. No layer caching surprises.
+
+cell {
+  name = "myapp"
+  base = "alpine:3.19"
+
+  env {
+    NODE_ENV = "production"
+    PORT = "3000"
+  }
+
+  fs {
+    copy "src/" to "/app/src"
+    copy "package.json" to "/app/"
+  }
+
+  run = "/app/start.sh"
+  expose = [3000, 8080]
+}
