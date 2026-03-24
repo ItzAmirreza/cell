@@ -1,3 +1,3 @@
 mod ptrace;
 
-pub use ptrace::MacosGuard;
+pub use self::ptrace::MacosGuard;

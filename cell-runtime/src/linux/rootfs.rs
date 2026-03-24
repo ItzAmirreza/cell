@@ -9,30 +9,38 @@ use anyhow::Result;
 pub fn prepare_rootfs(layers: &[impl AsRef<Path>], target: &Path) -> Result<()> {
     std::fs::create_dir_all(target)?;
 
-    for layer_path in layers {
-        // TODO: Extract layer contents into target.
-        // For now, layers are stored as directories — copy their contents.
-        let layer = layer_path.as_ref();
+    for layer in layers {
+        let layer = layer.as_ref();
         if layer.is_dir() {
             copy_dir_recursive(layer, target)?;
+        }
+    }
+
+    // Create essential directories that processes expect
+    for dir in &["proc", "sys", "dev", "tmp", "etc", "var", "run"] {
+        let p = target.join(dir);
+        if !p.exists() {
+            std::fs::create_dir_all(&p)?;
         }
     }
 
     Ok(())
 }
 
-/// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
+        let path = entry.path();
+        let target = dest.join(entry.file_name());
 
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+        if path.is_dir() {
+            std::fs::create_dir_all(&target)?;
+            copy_dir_recursive(&path, &target)?;
         } else {
-            std::fs::copy(&src_path, &dst_path)?;
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&path, &target)?;
         }
     }
     Ok(())

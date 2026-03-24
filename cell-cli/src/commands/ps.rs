@@ -1,61 +1,43 @@
 use anyhow::Result;
-use cell_store::{ContainerStatus, ContainerStore};
-use colored::Colorize;
+
+use cell_store::ContainerStore;
 
 use super::cell_home;
 
-pub fn execute() -> Result<()> {
-    let containers = ContainerStore::new(cell_home().join("containers"));
-    let list = containers.list()?;
+pub fn ps() -> Result<()> {
+    let home = cell_home();
+    let store = ContainerStore::with_root(home)?;
 
-    if super::is_json() {
-        let arr: Vec<serde_json::Value> = list
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "id": c.id,
-                    "image": c.image,
-                    "status": format!("{:?}", c.status),
-                    "pid": c.pid,
-                    "created_at": c.created_at
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string(&arr)?);
-        return Ok(());
-    }
+    let containers = store.list()?;
 
-    if list.is_empty() {
+    if containers.is_empty() {
         println!("No containers found.");
         return Ok(());
     }
 
     println!(
-        "{:<12} {:<20} {:<12} {:<10} {}",
-        "CONTAINER", "IMAGE", "STATUS", "PID", "CREATED"
+        "{:<14} {:<24} {:<12} {}",
+        "CONTAINER ID", "IMAGE", "STATUS", "CREATED"
     );
     println!("{}", "-".repeat(70));
 
-    for c in &list {
-        let created = if c.created_at.len() > 19 {
-            &c.created_at[..19]
-        } else {
-            &c.created_at
-        };
-        let status_str = match c.status {
-            ContainerStatus::Running => format!("{:?}", c.status).green().to_string(),
-            ContainerStatus::Stopped => format!("{:?}", c.status).red().to_string(),
-            ContainerStatus::Created => format!("{:?}", c.status).cyan().to_string(),
-        };
+    for c in &containers {
+        let status = format!("{:?}", c.status).to_lowercase();
+        let created = format_date(&c.created_at);
         println!(
-            "{:<12} {:<20} {:<12} {:<10} {}",
-            c.id.bold(),
-            &c.image,
-            status_str,
-            c.pid.map_or("-".to_string(), |p| p.to_string()),
-            created,
+            "{:<14} {:<24} {:<12} {}",
+            &c.id, c.image, status, created,
         );
     }
 
     Ok(())
+}
+
+/// Truncate an RFC 3339 timestamp to a shorter display form.
+fn format_date(rfc3339: &str) -> String {
+    if rfc3339.len() >= 19 {
+        rfc3339[..19].replace('T', " ")
+    } else {
+        rfc3339.to_string()
+    }
 }

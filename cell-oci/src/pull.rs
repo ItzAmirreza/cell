@@ -1,249 +1,231 @@
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use cell_format::{ContentRef, EnvVar, ImageConfig, ImageManifest};
-use cell_store::{BlobStore, ImageStore};
 use flate2::read::GzDecoder;
 
-use crate::registry::{ImageRef, RegistryClient};
+use cell_format::{ContentRef, ImageConfig, ImageManifest};
+use cell_store::{BlobStore, ImageStore};
 
-/// Get the Cell home directory.
-fn cell_home() -> PathBuf {
-    dirs::home_dir()
-        .expect("could not determine home directory")
-        .join(".cell")
-}
+use crate::convert::oci_config_to_cellspec;
+use crate::registry::{ImageRef, OciConfig, RegistryClient};
 
-/// Pull an OCI image from a registry and convert it to Cell format.
+/// Pull an OCI/Docker image from a remote registry and store it locally.
+///
+/// Returns the safe (filesystem-friendly) image name used as the store key
+/// (e.g. `alpine_3.19` for `alpine:3.19`).
 pub fn pull_image(reference: &str) -> Result<String> {
-    let image = ImageRef::parse(reference);
-    let home = cell_home();
-    let blobs = BlobStore::new(home.join("store").join("blobs"));
-    let images = ImageStore::new(home.join("store").join("images"));
+    let image = ImageRef::parse(reference)?;
 
-    println!("  resolving {}...", image.full_ref());
+    // Build a short, user-facing display name.  For Docker Hub library images
+    // (repository = "library/foo") we strip the "library/" prefix so the user
+    // can simply type `alpine:3.19` instead of `library/alpine:3.19`.
+    let short_repo = image
+        .repository
+        .strip_prefix("library/")
+        .unwrap_or(&image.repository);
+    let display_name = format!("{}:{}", short_repo, image.tag);
 
-    // 1. Authenticate
+    // The on-disk store key must be a single path component — replace
+    // characters that are problematic in filenames.
+    let image_name = display_name.replace('/', "_").replace(':', "_");
+
+    eprintln!("Pulling {}...", image.full_ref());
+
+    // --- authenticate ---
     let mut client = RegistryClient::new();
-    client.authenticate(&image)?;
+    client
+        .authenticate(&image)
+        .context("authentication failed")?;
 
-    // 2. Get manifest (may be a manifest list)
-    let raw_manifest = client.get_manifest(&image)?;
+    // --- fetch manifest (resolve fat manifests) ---
+    eprintln!("Fetching manifest...");
+    let manifest = client.get_manifest(&image)?;
 
-    // 3. Resolve to a single-platform manifest
-    let manifest = client.resolve_manifest(&image, &raw_manifest)?;
+    // --- fetch config ---
+    eprintln!("Fetching config...");
+    let oci_config: OciConfig = client.get_config(&image, &manifest)?;
 
-    // 4. Get the image config
-    let config = client.get_config(&image, &manifest)?;
+    // --- set up local stores ---
+    let cell_home = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".cell");
 
-    // 5. Download and store each layer
-    let layer_descs = manifest.layers.as_ref().context("manifest has no layers")?;
-    let mut cell_layers = Vec::new();
+    let blob_store = BlobStore::new(cell_home.join("blobs"))?;
+    let image_store = ImageStore::new(cell_home.join("images"))?;
+    let layers_dir = cell_home.join("layers");
+    std::fs::create_dir_all(&layers_dir)?;
 
-    for (i, layer) in layer_descs.iter().enumerate() {
-        let short_digest = if layer.digest.len() > 19 {
-            &layer.digest[..19]
-        } else {
-            &layer.digest
-        };
-        let size_mb = layer.size as f64 / 1024.0 / 1024.0;
-        println!(
-            "  layer {}/{}: {} ({:.1} MB)",
+    // --- download and store layers ---
+    let mut layer_refs: Vec<ContentRef> = Vec::new();
+
+    for (i, layer_desc) in manifest.layers.iter().enumerate() {
+        let short_digest = &layer_desc.digest[..std::cmp::min(layer_desc.digest.len(), 19)];
+        eprintln!(
+            "Downloading layer {}/{}: {}...",
             i + 1,
-            layer_descs.len(),
+            manifest.layers.len(),
             short_digest,
-            size_mb
         );
 
-        // Check if we already have this blob (dedup)
-        let cell_digest_check = format!("sha256-{}", &layer.digest[7..]); // convert "sha256:abc" to "sha256-abc"
-        if blobs.exists(&cell_digest_check) {
-            println!("    already exists, skipping download");
-            cell_layers.push(ContentRef {
-                digest: cell_digest_check,
-                size: layer.size,
-                media_type: "application/cell.layer.v1".into(),
-            });
-            continue;
+        let data = client.get_blob(&image, &layer_desc.digest)?;
+        let digest = blob_store.put(&data)?;
+
+        // Extract layer into a directory named after its digest.
+        let layer_dir = layers_dir.join(&digest);
+        if !layer_dir.exists() {
+            std::fs::create_dir_all(&layer_dir)?;
+            extract_layer(&data, &layer_dir)
+                .with_context(|| format!("failed to extract layer {}", short_digest))?;
         }
 
-        // Download the layer blob
-        let data = client.get_blob(&image, &layer.digest)?;
-
-        // Store the raw compressed layer
-        let digest = blobs.put(&data)?;
-        println!("    stored as {}", &digest[..20]);
-
-        cell_layers.push(ContentRef {
+        layer_refs.push(ContentRef {
             digest,
             size: data.len() as u64,
-            media_type: "application/cell.layer.v1".into(),
+            media_type: layer_desc.media_type.clone(),
         });
     }
 
-    // 6. Build the Cell image manifest
-    let container_config = config.config.as_ref();
+    // --- convert OCI config to Cell manifest ---
+    let container_config = oci_config.config.unwrap_or_default();
+    let env = container_config.env.unwrap_or_default();
+    let entrypoint = container_config.entrypoint.unwrap_or_default();
+    let cmd = container_config.cmd.unwrap_or_default();
+    let workdir = container_config.working_dir;
 
-    let env_vars = container_config
-        .and_then(|c| c.env.as_ref())
-        .map(|envs| {
-            envs.iter()
-                .filter_map(|e| {
-                    let (k, v) = e.split_once('=')?;
-                    Some(EnvVar {
-                        key: k.to_string(),
-                        value: v.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let exposed_ports = parse_exposed_ports(&container_config.exposed_ports);
 
-    let entrypoint = container_config.and_then(|c| {
-        c.entrypoint
-            .as_ref()
-            .map(|ep| ep.join(" "))
-            .or_else(|| c.cmd.as_ref().map(|cmd| cmd.join(" ")))
-    });
+    let spec = oci_config_to_cellspec(
+        &image_name,
+        &env,
+        &entrypoint,
+        &cmd,
+        &exposed_ports,
+        workdir.as_deref(),
+    );
 
-    let exposed_ports = container_config
-        .and_then(|c| c.exposed_ports.as_ref())
-        .and_then(|ports| {
-            if let serde_json::Value::Object(map) = ports {
-                Some(
-                    map.keys()
-                        .filter_map(|k| k.split('/').next()?.parse::<u16>().ok())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    // Use a safe name for the image (replace / and : with _)
-    let safe_name = reference
-        .replace('/', "_")
-        .replace(':', "_");
+    let created_at = chrono::Utc::now().to_rfc3339();
 
     let cell_manifest = ImageManifest {
-        name: safe_name.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        name: image_name.clone(),
+        created_at,
         config: ImageConfig {
-            env: env_vars,
-            entrypoint,
+            env,
+            entrypoint: if entrypoint.is_empty() {
+                None
+            } else {
+                Some(entrypoint)
+            },
             exposed_ports,
-            workdir: container_config.and_then(|c| c.working_dir.clone()),
+            workdir,
         },
-        layers: cell_layers,
-        limits: None,
-        ports: vec![],
-        volumes: vec![],
+        layers: layer_refs,
     };
 
-    images.save(&cell_manifest)?;
+    image_store.save(&cell_manifest)?;
 
-    println!("  image '{}' saved ({} layers)", safe_name, cell_manifest.layers.len());
+    // Write a Cellfile alongside the manifest for convenience.
+    let cellfile_text = crate::convert::cellspec_to_cellfile(&spec);
+    let cellfile_path = cell_home.join("images").join(format!("{image_name}.Cellfile"));
+    std::fs::write(&cellfile_path, cellfile_text)?;
 
-    Ok(safe_name)
+    eprintln!("Image stored as '{}' ({})", image_name, display_name);
+    Ok(image_name)
 }
 
-/// Extract a gzipped tar layer into a target directory.
-/// Windows-safe: skips symlinks, hardlinks, device nodes, and whiteout files.
-/// Handles path separators and permission errors gracefully.
-pub fn extract_layer(data: &[u8], target: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(target)?;
-
-    let decoder = GzDecoder::new(Cursor::new(data));
-    let mut archive = tar::Archive::new(decoder);
-    archive.set_preserve_permissions(false);
-    archive.set_preserve_mtime(false);
-    // Don't overwrite — later layers should override earlier ones
+/// Extract a gzip-compressed tar layer to the given directory.
+pub fn extract_layer(data: &[u8], target: &Path) -> Result<()> {
+    let gz = GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(true);
     archive.set_overwrite(true);
 
-    let mut extracted = 0u32;
-    let mut skipped = 0u32;
-
+    // Unpack entry by entry, skipping entries that fail (e.g. whiteout
+    // markers, device nodes on non-root).
     for entry_result in archive.entries().context("failed to read tar entries")? {
         let mut entry = match entry_result {
             Ok(e) => e,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
+            Err(_) => continue,
         };
 
-        let entry_type = entry.header().entry_type();
-
-        // Skip symlinks, hardlinks, device nodes, FIFOs — Windows can't handle these
-        match entry_type {
-            tar::EntryType::Symlink
-            | tar::EntryType::Link
-            | tar::EntryType::Char
-            | tar::EntryType::Block
-            | tar::EntryType::Fifo => {
-                skipped += 1;
-                continue;
-            }
-            _ => {}
-        }
-
-        let path = match entry.path() {
-            Ok(p) => p.to_path_buf(),
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
-        };
-
-        // Skip OCI whiteout files (.wh.*)
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if file_name.starts_with(".wh.") {
-            skipped += 1;
+        // Skip whiteout / opaque-whiteout markers.
+        let path_bytes = entry.path_bytes();
+        let path_lossy = String::from_utf8_lossy(&path_bytes);
+        if path_lossy.contains(".wh.") {
             continue;
         }
 
-        // Skip paths that try to escape the target (path traversal)
-        let full_path = target.join(&path);
-        if !full_path.starts_with(target) {
-            skipped += 1;
-            continue;
-        }
-
-        match entry_type {
-            tar::EntryType::Directory => {
-                let _ = std::fs::create_dir_all(&full_path);
-                extracted += 1;
-            }
-            tar::EntryType::Regular | tar::EntryType::GNUSparse => {
-                if let Some(parent) = full_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Read entry data and write to file
-                let mut data = Vec::new();
-                if std::io::Read::read_to_end(&mut entry, &mut data).is_ok() {
-                    if std::fs::write(&full_path, &data).is_ok() {
-                        extracted += 1;
-                    } else {
-                        skipped += 1;
-                    }
-                } else {
-                    skipped += 1;
-                }
-            }
-            _ => {
-                skipped += 1;
-            }
-        }
-    }
-
-    if extracted == 0 && skipped > 0 {
-        anyhow::bail!("no files extracted ({skipped} skipped)");
+        // Best-effort unpack — some entries (char devices, etc.) will fail
+        // when not running as root; that is fine.
+        let _ = entry.unpack_in(target);
     }
 
     Ok(())
+}
+
+/// Parse OCI `ExposedPorts` (a JSON object like `{"80/tcp":{}}`) into a
+/// sorted `Vec<u16>`.
+fn parse_exposed_ports(value: &Option<serde_json::Value>) -> Vec<u16> {
+    let Some(serde_json::Value::Object(map)) = value else {
+        return Vec::new();
+    };
+
+    let mut ports: Vec<u16> = map
+        .keys()
+        .filter_map(|k| {
+            // Keys look like "80/tcp" or just "80".
+            k.split('/').next().and_then(|p| p.parse().ok())
+        })
+        .collect();
+
+    ports.sort();
+    ports.dedup();
+    ports
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_exposed_ports_empty() {
+        assert!(parse_exposed_ports(&None).is_empty());
+    }
+
+    #[test]
+    fn parse_exposed_ports_typical() {
+        let val: serde_json::Value =
+            serde_json::json!({"80/tcp": {}, "443/tcp": {}, "8080/tcp": {}});
+        let ports = parse_exposed_ports(&Some(val));
+        assert_eq!(ports, vec![80, 443, 8080]);
+    }
+
+    #[test]
+    fn extract_layer_from_bytes() {
+        // Build a tiny tar.gz in memory.
+        let buf = Vec::new();
+        let encoder = flate2::write::GzEncoder::new(buf, flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+
+        let data = b"hello from layer";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "testfile.txt", &data[..])
+            .unwrap();
+
+        let compressed = builder.into_inner().unwrap().finish().unwrap();
+
+        let tmp = std::env::temp_dir().join("cell_test_extract_layer");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        extract_layer(&compressed, &tmp).unwrap();
+
+        let content = std::fs::read_to_string(tmp.join("testfile.txt")).unwrap();
+        assert_eq!(content, "hello from layer");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

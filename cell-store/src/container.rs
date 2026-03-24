@@ -1,179 +1,244 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-/// Tracks the lifecycle state of a container.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Lifecycle status of a container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ContainerStatus {
     Created,
     Running,
     Stopped,
 }
 
-/// Persistent state for a single container.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted state for a single container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerState {
     pub id: String,
     pub image: String,
     pub status: ContainerStatus,
-    pub pid: Option<u32>,
     pub created_at: String,
+    pub pid: Option<u32>,
     pub rootfs_path: PathBuf,
 }
 
-/// Storage for container state files.
+/// On-disk store for container state.
+///
+/// Layout:
+/// ```text
+/// <root>/
+///   containers/
+///     <id>/
+///       state.json
+///       rootfs/
+/// ```
 pub struct ContainerStore {
     root: PathBuf,
 }
 
 impl ContainerStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// Return the default store root: `~/.cell`.
+    fn default_root() -> PathBuf {
+        dirs::home_dir()
+            .expect("could not determine home directory")
+            .join(".cell")
     }
 
-    pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create container store at {:?}", self.root))
+    /// Create a `ContainerStore` at the default location (`~/.cell`).
+    pub fn new() -> Result<Self> {
+        Self::with_root(Self::default_root())
     }
 
-    /// Create a new container record and return its state.
+    /// Create a `ContainerStore` rooted at `root`.
+    pub fn with_root(root: PathBuf) -> Result<Self> {
+        let containers = root.join("containers");
+        fs::create_dir_all(&containers).with_context(|| {
+            format!("failed to create container store at {}", containers.display())
+        })?;
+        Ok(Self { root })
+    }
+
+    fn containers_dir(&self) -> PathBuf {
+        self.root.join("containers")
+    }
+
+    fn state_path(&self, id: &str) -> PathBuf {
+        self.containers_dir().join(id).join("state.json")
+    }
+
+    /// Create a new container for the given image.
+    ///
+    /// Generates a short UUID identifier, creates the on-disk directory
+    /// structure, writes the initial `state.json`, and returns the state.
     pub fn create(&self, image: &str) -> Result<ContainerState> {
-        self.init()?;
-        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let container_dir = self.root.join(&id);
-        fs::create_dir_all(&container_dir)?;
+        let id = Uuid::new_v4().to_string()[..12].to_string();
 
-        let rootfs_path = container_dir.join("rootfs");
-        fs::create_dir_all(&rootfs_path)?;
+        let dir = self.containers_dir().join(&id);
+        let rootfs = dir.join("rootfs");
+        fs::create_dir_all(&rootfs)
+            .with_context(|| format!("failed to create container dir {}", dir.display()))?;
 
         let state = ContainerState {
             id: id.clone(),
             image: image.to_string(),
             status: ContainerStatus::Created,
+            created_at: Utc::now().to_rfc3339(),
             pid: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            rootfs_path,
+            rootfs_path: rootfs,
         };
 
-        self.save(&state)?;
+        let json =
+            serde_json::to_string_pretty(&state).context("failed to serialize container state")?;
+        fs::write(self.state_path(&id), json).context("failed to write state.json")?;
+
         Ok(state)
     }
 
-    /// Save container state to disk.
-    pub fn save(&self, state: &ContainerState) -> Result<()> {
-        let path = self.root.join(&state.id).join("state.json");
-        let json = serde_json::to_string_pretty(state)?;
-        fs::write(&path, json)?;
-        Ok(())
-    }
-
-    /// Load container state by ID (supports prefix matching).
+    /// Load container state by exact id or by unique prefix match.
     pub fn get(&self, id: &str) -> Result<ContainerState> {
-        // Support prefix matching: "a1b2" matches "a1b2c3d4"
-        let full_id = self.resolve_id(id)?;
-        let path = self.root.join(&full_id).join("state.json");
-        let json =
-            fs::read_to_string(&path).with_context(|| format!("container not found: '{id}'"))?;
-        Ok(serde_json::from_str(&json)?)
-    }
+        // Try exact match first.
+        let exact = self.state_path(id);
+        if exact.exists() {
+            let data = fs::read_to_string(&exact).context("failed to read state.json")?;
+            return serde_json::from_str(&data).context("failed to parse state.json");
+        }
 
-    /// List all containers.
-    pub fn list(&self) -> Result<Vec<ContainerState>> {
-        self.init()?;
-        let mut containers = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        // Prefix match.
+        let mut matches: Vec<String> = Vec::new();
+        for entry in fs::read_dir(self.containers_dir()).context("failed to list containers")? {
             let entry = entry?;
-            let state_path = entry.path().join("state.json");
-            if state_path.exists() {
-                let json = fs::read_to_string(&state_path)?;
-                if let Ok(state) = serde_json::from_str::<ContainerState>(&json) {
-                    containers.push(state);
-                }
-            }
-        }
-        containers.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-        Ok(containers)
-    }
-
-    /// Remove a container directory entirely.
-    pub fn remove(&self, id: &str) -> Result<()> {
-        let full_id = self.resolve_id(id)?;
-        let dir = self.root.join(&full_id);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
-        Ok(())
-    }
-
-    /// Resolve a possibly-abbreviated ID to a full container ID.
-    fn resolve_id(&self, prefix: &str) -> Result<String> {
-        if self.root.join(prefix).exists() {
-            return Ok(prefix.to_string());
-        }
-
-        let mut matches = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(prefix) {
-                    matches.push(name);
-                }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(id) {
+                matches.push(name);
             }
         }
 
         match matches.len() {
-            0 => anyhow::bail!("no container found matching '{prefix}'"),
-            1 => Ok(matches.into_iter().next().unwrap()),
-            _ => anyhow::bail!("ambiguous container ID '{prefix}', matches: {matches:?}"),
+            0 => bail!("container not found: {id}"),
+            1 => {
+                let path = self.state_path(&matches[0]);
+                let data = fs::read_to_string(&path).context("failed to read state.json")?;
+                serde_json::from_str(&data).context("failed to parse state.json")
+            }
+            n => bail!("ambiguous container prefix '{id}': matches {n} containers"),
         }
+    }
+
+    /// Persist an updated `ContainerState`.
+    pub fn update(&self, state: &ContainerState) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(state).context("failed to serialize container state")?;
+        fs::write(self.state_path(&state.id), json).context("failed to write state.json")?;
+        Ok(())
+    }
+
+    /// List every container in the store.
+    pub fn list(&self) -> Result<Vec<ContainerState>> {
+        let mut states = Vec::new();
+        for entry in fs::read_dir(self.containers_dir()).context("failed to list containers")? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                let path = entry.path().join("state.json");
+                if path.exists() {
+                    let data = fs::read_to_string(&path).context("failed to read state.json")?;
+                    let state: ContainerState =
+                        serde_json::from_str(&data).context("failed to parse state.json")?;
+                    states.push(state);
+                }
+            }
+        }
+        states.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(states)
+    }
+
+    /// Remove a container and its entire directory tree.
+    pub fn remove(&self, id: &str) -> Result<()> {
+        // Resolve prefix first so `remove("abc")` works the same as `get("abc")`.
+        let state = self.get(id)?;
+        let dir = self.containers_dir().join(&state.id);
+        fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove container {}", state.id))?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    #[test]
-    fn test_create_and_get() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ContainerStore::new(tmp.path().join("containers"));
-        let state = store.create("myapp").unwrap();
-        assert_eq!(state.image, "myapp");
-        assert_eq!(state.status, ContainerStatus::Created);
-
-        let loaded = store.get(&state.id).unwrap();
-        assert_eq!(loaded.id, state.id);
+    fn store() -> (ContainerStore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = ContainerStore::with_root(tmp.path().to_path_buf()).unwrap();
+        (store, tmp)
     }
 
     #[test]
-    fn test_list() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ContainerStore::new(tmp.path().join("containers"));
-        store.create("app1").unwrap();
-        store.create("app2").unwrap();
-        let list = store.list().unwrap();
-        assert_eq!(list.len(), 2);
+    fn create_container() {
+        let (s, _tmp) = store();
+        let c = s.create("myimage:latest").unwrap();
+        assert_eq!(c.image, "myimage:latest");
+        assert_eq!(c.status, ContainerStatus::Created);
+        assert_eq!(c.id.len(), 12);
+        assert!(c.pid.is_none());
+        assert!(c.rootfs_path.ends_with(format!("{}/rootfs", c.id)));
     }
 
     #[test]
-    fn test_remove() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ContainerStore::new(tmp.path().join("containers"));
-        let state = store.create("doomed").unwrap();
-        store.remove(&state.id).unwrap();
-        assert!(store.get(&state.id).is_err());
+    fn get_by_exact_id() {
+        let (s, _tmp) = store();
+        let c = s.create("img").unwrap();
+        let loaded = s.get(&c.id).unwrap();
+        assert_eq!(loaded, c);
     }
 
     #[test]
-    fn test_prefix_matching() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ContainerStore::new(tmp.path().join("containers"));
-        let state = store.create("app").unwrap();
-        // First 4 chars should match
-        let prefix = &state.id[..4];
-        let loaded = store.get(prefix).unwrap();
-        assert_eq!(loaded.id, state.id);
+    fn get_by_prefix() {
+        let (s, _tmp) = store();
+        let c = s.create("img").unwrap();
+        // Use the first 4 characters as a prefix.
+        let prefix = &c.id[..4];
+        let loaded = s.get(prefix).unwrap();
+        assert_eq!(loaded.id, c.id);
+    }
+
+    #[test]
+    fn update_state() {
+        let (s, _tmp) = store();
+        let mut c = s.create("img").unwrap();
+        c.status = ContainerStatus::Running;
+        c.pid = Some(1234);
+        s.update(&c).unwrap();
+
+        let loaded = s.get(&c.id).unwrap();
+        assert_eq!(loaded.status, ContainerStatus::Running);
+        assert_eq!(loaded.pid, Some(1234));
+    }
+
+    #[test]
+    fn list_containers() {
+        let (s, _tmp) = store();
+        s.create("a").unwrap();
+        s.create("b").unwrap();
+        let all = s.list().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn remove_container() {
+        let (s, _tmp) = store();
+        let c = s.create("img").unwrap();
+        s.remove(&c.id).unwrap();
+        assert!(s.get(&c.id).is_err());
+    }
+
+    #[test]
+    fn get_missing_returns_error() {
+        let (s, _tmp) = store();
+        assert!(s.get("nonexistent").is_err());
     }
 }

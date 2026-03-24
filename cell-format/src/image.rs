@@ -1,35 +1,35 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{EnvVar, PortMapping, ResourceLimits, VolumeMount};
-
-/// A reference to a content-addressed blob in the store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A content-addressable reference to a blob (layer, config, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentRef {
+    /// Digest string, e.g. "sha256:abc123...".
     pub digest: String,
+    /// Size in bytes.
     pub size: u64,
+    /// Media type, e.g. "application/vnd.oci.image.layer.v1.tar+gzip".
     pub media_type: String,
 }
 
-/// Configuration for a container image.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Runtime configuration carried inside an image manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageConfig {
-    pub env: Vec<EnvVar>,
-    pub entrypoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exposed_ports: Vec<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 }
 
-/// A Cell image manifest — the root object stored per image.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An image manifest produced after building a cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageManifest {
     pub name: String,
     pub created_at: String,
     pub config: ImageConfig,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<ContentRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits: Option<ResourceLimits>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ports: Vec<PortMapping>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub volumes: Vec<VolumeMount>,
 }

@@ -1,54 +1,62 @@
 use anyhow::{Context, Result};
+
+use cell_runtime;
 use cell_store::{ContainerStore, ImageStore};
-use colored::Colorize;
 
 use super::cell_home;
 
-pub fn execute(id: &str, command: &str, interactive: bool) -> Result<()> {
+pub fn exec(id: &str, command: &str) -> Result<()> {
     let home = cell_home();
-    let containers = ContainerStore::new(home.join("containers"));
-    let images = ImageStore::new(home.join("store").join("images"));
+    let container_store = ContainerStore::with_root(home.clone())?;
+    let image_store = ImageStore::new(home.join("images"))?;
 
-    let json_mode = super::is_json();
+    // Load the container state by id or prefix.
+    let mut state = container_store
+        .get(id)
+        .with_context(|| format!("container not found: {id}"))?;
 
-    // Find the container
-    let state = containers.get(id)?;
-    if json_mode {
-        eprintln!("Attaching to container {} (image: '{}')", state.id, state.image);
-    } else {
-        println!("{} container {} (image: '{}')", "Attaching to".cyan(), state.id.bold(), state.image.bold());
-    }
+    // Load the image manifest to get env vars.
+    let image = &state.image;
+    let manifest = image_store.load(image).or_else(|_| {
+        let safe = image.replace('/', "_").replace(':', "_");
+        if safe != *image {
+            image_store.load(&safe)
+        } else {
+            Err(anyhow::anyhow!("image not found: {image}"))
+        }
+    }).with_context(|| format!("image not found for container: {image}"))?;
 
-    // Load the image manifest to get config (env, ports, volumes, limits)
-    let manifest = images
-        .load(&state.image)
-        .with_context(|| format!("image '{}' not found for container {}", state.image, state.id))?;
-
+    // Build environment variables from the image config.
     let env: Vec<(String, String)> = manifest
         .config
         .env
         .iter()
-        .map(|e| (e.key.clone(), e.value.clone()))
+        .filter_map(|e| {
+            let mut parts = e.splitn(2, '=');
+            let key = parts.next()?.to_string();
+            let value = parts.next().unwrap_or("").to_string();
+            Some((key, value))
+        })
         .collect();
 
-    // Create a new mutable state for this exec session (reuses the same rootfs)
-    let mut exec_state = state.clone();
+    // Create a guard and run the command in the existing container rootfs.
+    let guard = cell_runtime::create_guard();
 
-    let guard = cell_runtime::create_guard(&manifest);
-    let exit_code = guard.run(&mut exec_state, command, &env, interactive)?;
+    println!(
+        "Executing '{}' in container {}...",
+        command,
+        &state.id[..8]
+    );
 
-    if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "container_id": exec_state.id,
-                "exit_code": exit_code
-            }))?
-        );
-    } else if exit_code == 0 {
-        println!("Exec in container {} exited with code {}", exec_state.id.bold(), exit_code.to_string().green());
-    } else {
-        println!("Exec in container {} exited with code {}", exec_state.id.bold(), exit_code.to_string().red());
-    }
+    let exit_code = guard.run(&mut state, command, &env)?;
+
+    // Persist updated state.
+    container_store.update(&state)?;
+
+    println!(
+        "Container {} exec exited with code {}",
+        &state.id[..8],
+        exit_code
+    );
     Ok(())
 }

@@ -1,167 +1,166 @@
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use cell_format::ResourceLimits as FormatResourceLimits;
+use cell_runtime::{self, ResourceLimits as RuntimeResourceLimits};
 use cell_store::{BlobStore, ContainerStore, ImageStore};
-use colored::Colorize;
 
 use super::cell_home;
 
-/// A layer entry from cell build.
-#[derive(serde::Deserialize)]
-struct LayerEntry {
-    dest: String,
-    files: Vec<LayerFile>,
-}
-
-#[derive(serde::Deserialize)]
-struct LayerFile {
-    path: String,
-    data: Vec<u8>,
-}
-
-pub fn execute(image: &str, command: Option<&str>, interactive: bool) -> Result<()> {
+pub fn run(image: &str, command: Option<&str>) -> Result<()> {
     let home = cell_home();
-    let blobs = BlobStore::new(home.join("store").join("blobs"));
-    let images = ImageStore::new(home.join("store").join("images"));
-    let containers = ContainerStore::new(home.join("containers"));
+    let image_store = ImageStore::new(home.join("images"))?;
+    let blob_store = BlobStore::new(home.join("blobs"))?;
+    let container_store = ContainerStore::with_root(home.clone())?;
 
-    let manifest = images
-        .load(image)
-        .with_context(|| format!("image '{image}' not found. Use 'cell build' or 'cell pull'."))?;
-
-    let cmd = command
-        .map(|s| s.to_string())
-        .or(manifest.config.entrypoint.clone())
-        .unwrap_or_else(|| "cmd.exe".to_string());
-
-    let mut state = containers.create(image)?;
-    let json_mode = super::is_json();
-    if json_mode {
-        eprintln!("Container {} created from image '{}'", state.id, image);
-    } else {
-        println!("{} {} from image '{}'", "Container".cyan(), state.id.bold(), image.bold());
-    }
-
-    // Extract layers into rootfs
-    if !manifest.layers.is_empty() {
-        if json_mode {
-            eprintln!("Preparing rootfs ({} layers)...", manifest.layers.len());
+    // Load the image manifest.
+    // Try the literal name first, then fall back to a filesystem-safe form
+    // (e.g. "alpine:3.19" -> "alpine_3.19") so that users can refer to
+    // pulled images either way.
+    let manifest = image_store.load(image).or_else(|_| {
+        let safe = image.replace('/', "_").replace(':', "_");
+        if safe != image {
+            image_store.load(&safe)
         } else {
-            println!("Preparing rootfs ({} layers)...", manifest.layers.len());
+            Err(anyhow::anyhow!("image not found: {image}"))
         }
-        for (i, layer) in manifest.layers.iter().enumerate() {
-            if let Ok(data) = blobs.get(&layer.digest) {
-                let short = if layer.digest.len() > 16 {
-                    &layer.digest[..16]
-                } else {
-                    &layer.digest
-                };
+    }).with_context(|| format!("image not found: {image}"))?;
 
-                let media = &layer.media_type;
-                if media.contains("+json") || media == "application/cell.layer.v1+json" {
-                    // Cell-native layer format (from cell build)
-                    match extract_cell_layer(&data, &state.rootfs_path) {
-                        Ok(n) => {
-                            if json_mode {
-                                eprintln!("  layer {}/{} ({}) -> {} file(s)", i + 1, manifest.layers.len(), short, n);
-                            } else {
-                                println!("  layer {}/{} ({}) -> {} file(s)", i + 1, manifest.layers.len(), short, n);
-                            }
-                        }
-                        Err(e) => {
-                            if json_mode {
-                                eprintln!("  layer {}/{} ({}) skip: {}", i + 1, manifest.layers.len(), short, e);
-                            } else {
-                                println!("  layer {}/{} ({}) skip: {}", i + 1, manifest.layers.len(), short, e);
-                            }
-                        }
-                    }
-                } else {
-                    // OCI layer (gzip tar from cell pull)
-                    match cell_oci::pull::extract_layer(&data, &state.rootfs_path) {
-                        Ok(_) => {
-                            if json_mode {
-                                eprintln!("  layer {}/{} ({}) ok (oci)", i + 1, manifest.layers.len(), short);
-                            } else {
-                                println!("  layer {}/{} ({}) ok (oci)", i + 1, manifest.layers.len(), short);
-                            }
-                        }
-                        Err(e) => {
-                            if json_mode {
-                                eprintln!("  layer {}/{} ({}) skip: {}", i + 1, manifest.layers.len(), short, e);
-                            } else {
-                                println!("  layer {}/{} ({}) skip: {}", i + 1, manifest.layers.len(), short, e);
-                            }
-                        }
-                    }
-                }
-            }
+    println!("Creating container from '{}'...", manifest.name);
+
+    // Create a container entry.
+    let mut state = container_store.create(&manifest.name)?;
+    // rootfs_path is already absolute (set by ContainerStore::create), so
+    // use it directly instead of joining with home (which would double-prefix).
+    let rootfs = state.rootfs_path.clone();
+    fs::create_dir_all(&rootfs)?;
+
+    // Extract layers into the rootfs.
+    for layer_ref in &manifest.layers {
+        let blob = blob_store.get(&layer_ref.digest)?;
+
+        if layer_ref
+            .media_type
+            .contains("cell.layer")
+        {
+            // Cell-native JSON layer format.
+            extract_cell_layer(&blob, &rootfs)
+                .with_context(|| format!("failed to extract cell layer {}", layer_ref.digest))?;
+        } else {
+            // OCI gzip tar layer.
+            extract_oci_layer(&blob, &rootfs)
+                .with_context(|| format!("failed to extract OCI layer {}", layer_ref.digest))?;
         }
     }
 
+    // Build environment variables from the image config.
     let env: Vec<(String, String)> = manifest
         .config
         .env
         .iter()
-        .map(|e| (e.key.clone(), e.value.clone()))
+        .filter_map(|e| {
+            let mut parts = e.splitn(2, '=');
+            let key = parts.next()?.to_string();
+            let value = parts.next().unwrap_or("").to_string();
+            Some((key, value))
+        })
         .collect();
 
-    let guard = cell_runtime::create_guard(&manifest);
-    if json_mode {
-        eprintln!("Isolation: {}", guard.isolation_info().method);
+    // Determine the command to run.
+    let cmd = if let Some(c) = command {
+        c.to_string()
+    } else if let Some(ref ep) = manifest.config.entrypoint {
+        ep.join(" ")
     } else {
-        println!("Isolation: {}", guard.isolation_info().method);
-    }
+        "/bin/sh".to_string()
+    };
 
-    let exit_code = guard.run(&mut state, &cmd, &env, interactive)?;
-    containers.save(&state)?;
+    // Load resource limits if stored during build.
+    let limits = load_limits(&home, &manifest.name);
 
-    if json_mode {
+    // Create the guard (with or without resource limits).
+    let guard = if let Some(limits) = limits {
         println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "container_id": state.id,
-                "image": image,
-                "exit_code": exit_code,
-                "status": format!("{:?}", state.status)
-            }))?
+            "Applying resource limits: memory={}, processes={}",
+            limits.memory.map_or("unlimited".to_string(), |m| format!("{} bytes", m)),
+            limits.processes.map_or("unlimited".to_string(), |p| p.to_string()),
         );
-    } else if exit_code == 0 {
-        println!("{} {} exited with code {}", "Container".green(), state.id.bold(), exit_code.to_string().green());
+        let rt_limits = RuntimeResourceLimits {
+            memory_bytes: limits.memory.unwrap_or(0),
+            max_processes: limits.processes.unwrap_or(0) as u32,
+        };
+        cell_runtime::create_guard_with_limits(rt_limits)
     } else {
-        println!("{} {} exited with code {}", "Container".red(), state.id.bold(), exit_code.to_string().red());
-    }
+        cell_runtime::create_guard()
+    };
+
+    println!("Running '{}' in container {}...", cmd, &state.id[..8]);
+
+    // Run the process.
+    let exit_code = guard.run(&mut state, &cmd, &env)?;
+
+    // Persist final state.
+    container_store.update(&state)?;
+
+    println!("Container {} exited with code {}", &state.id[..8], exit_code);
     Ok(())
 }
 
-/// Extract a Cell-native layer (JSON with dest + files) into the rootfs.
-fn extract_cell_layer(data: &[u8], rootfs: &Path) -> Result<usize> {
-    let entry: LayerEntry = serde_json::from_slice(data)
-        .context("invalid cell layer format")?;
+// ---------------------------------------------------------------------------
+// Layer extraction
+// ---------------------------------------------------------------------------
 
-    let dest = entry.dest.trim_start_matches('/').trim_start_matches('\\');
+/// JSON structure used inside Cell-native layers (mirrors build.rs).
+#[derive(Debug, Deserialize)]
+struct LayerEntry {
+    #[allow(dead_code)]
+    dest: String,
+    files: Vec<LayerFile>,
+}
 
-    if entry.files.len() == 1 && !entry.dest.ends_with('/') {
-        // Single file with an explicit destination path (e.g., copy "x.txt" to "/hello.txt")
-        // Treat dest as the full file path, not a directory.
-        let file_path = rootfs.join(dest);
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
+#[derive(Debug, Deserialize)]
+struct LayerFile {
+    path: String,
+    data: String,
+}
+
+/// Extract a Cell-native JSON layer into the rootfs.
+fn extract_cell_layer(blob: &[u8], rootfs: &Path) -> Result<()> {
+    let entry: LayerEntry =
+        serde_json::from_slice(blob).context("failed to parse cell layer JSON")?;
+
+    for file in &entry.files {
+        let decoded = super::build::base64_decode(&file.data)
+            .context("failed to decode base64 layer data")?;
+
+        // Strip leading '/' so the join works correctly.
+        let rel = file.path.strip_prefix('/').unwrap_or(&file.path);
+        let dest = rootfs.join(rel);
+
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
         }
-        std::fs::write(&file_path, &entry.files[0].data)?;
-    } else {
-        // Multiple files or dest ends with / — treat dest as a directory.
-        let dest_dir = rootfs.join(dest);
-        std::fs::create_dir_all(&dest_dir)?;
-
-        for file in &entry.files {
-            let file_path = dest_dir.join(&file.path);
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&file_path, &file.data)?;
-        }
+        fs::write(&dest, &decoded)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
     }
 
-    Ok(entry.files.len())
+    Ok(())
+}
+
+/// Extract an OCI gzip-compressed tar layer into the rootfs.
+///
+/// Delegates to `cell_oci::pull::extract_layer` which handles gzip
+/// decompression, whiteout markers, and best-effort unpacking.
+fn extract_oci_layer(blob: &[u8], rootfs: &Path) -> Result<()> {
+    cell_oci::pull::extract_layer(blob, rootfs)
+}
+
+/// Try to load resource limits that were saved during `cell build`.
+fn load_limits(home: &Path, image_name: &str) -> Option<FormatResourceLimits> {
+    let path = home.join("images").join(image_name).join("limits.json");
+    let data = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
 }

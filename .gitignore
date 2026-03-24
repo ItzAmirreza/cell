@@ -1,22 +1,20 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Cell runtime data
 .cell/
 
-# Node/Bun (TUI)
-cell-tui/node_modules/
-cell-tui/dist/
-cell-tui/bun.lock
-
 # OS
 .DS_Store
 Thumbs.db
-*.swp
-*.swo
 
 # IDE
-.vscode/
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+testdata/

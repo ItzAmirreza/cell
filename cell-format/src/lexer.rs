@@ -1,179 +1,213 @@
 use crate::error::{ParseError, Span};
 
-/// Token types produced by the Cellfile lexer.
-#[derive(Debug, Clone, PartialEq)]
+/// Tokens produced by the Cellfile lexer.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
-    /// A bareword identifier (e.g. `cell`, `name`, `env`)
+    /// A bare identifier such as `cell`, `name`, `env`, `to`, …
     Ident(String),
-    /// A quoted string literal (e.g. `"hello"`)
+    /// A double-quoted string literal (escape sequences resolved).
     StringLit(String),
-    /// An integer literal (e.g. `8080`)
+    /// An integer literal.
     IntLit(i64),
-    /// `=`
-    Equals,
-    /// `{`
     LBrace,
-    /// `}`
     RBrace,
-    /// `[`
     LBracket,
-    /// `]`
     RBracket,
-    /// `,`
+    Equals,
     Comma,
-    /// End of file
     Eof,
 }
 
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Token::Ident(s) => write!(f, "{s}"),
-            Token::StringLit(s) => write!(f, "\"{s}\""),
-            Token::IntLit(n) => write!(f, "{n}"),
-            Token::Equals => write!(f, "="),
-            Token::LBrace => write!(f, "{{"),
-            Token::RBrace => write!(f, "}}"),
-            Token::LBracket => write!(f, "["),
-            Token::RBracket => write!(f, "]"),
-            Token::Comma => write!(f, ","),
-            Token::Eof => write!(f, "EOF"),
+            Token::Ident(s) => write!(f, "identifier `{s}`"),
+            Token::StringLit(s) => write!(f, "string \"{s}\""),
+            Token::IntLit(n) => write!(f, "integer {n}"),
+            Token::LBrace => write!(f, "`{{`"),
+            Token::RBrace => write!(f, "`}}`"),
+            Token::LBracket => write!(f, "`[`"),
+            Token::RBracket => write!(f, "`]`"),
+            Token::Equals => write!(f, "`=`"),
+            Token::Comma => write!(f, "`,`"),
+            Token::Eof => write!(f, "end of input"),
         }
     }
 }
 
-/// Tokenize a Cellfile source string into a list of (Token, Span) pairs.
+/// Tokenize a Cellfile source string into a sequence of (Token, Span) pairs.
+///
+/// Comments (lines starting with `#`) are stripped.  The final token is always
+/// `Token::Eof`.
 pub fn tokenize(input: &str) -> Result<Vec<(Token, Span)>, ParseError> {
     let mut tokens = Vec::new();
-    let mut chars = input.char_indices().peekable();
-    let mut line = 1usize;
-    let mut line_start = 0usize;
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut pos: usize = 0;
+    let mut line: usize = 1;
+    let mut col: usize = 1;
 
-    while let Some(&(i, ch)) = chars.peek() {
-        let col = i - line_start + 1;
+    while pos < len {
+        let b = bytes[pos];
 
-        match ch {
-            // Whitespace
-            ' ' | '\t' | '\r' => {
-                chars.next();
-            }
-            '\n' => {
-                chars.next();
-                line += 1;
-                line_start = i + 1;
-            }
-            // Comments
-            '#' => {
-                chars.next();
-                while let Some(&(_, c)) = chars.peek() {
-                    if c == '\n' {
-                        break;
-                    }
-                    chars.next();
-                }
-            }
-            // Single-char tokens
-            '=' => {
-                tokens.push((Token::Equals, Span { line, col }));
-                chars.next();
-            }
-            '{' => {
-                tokens.push((Token::LBrace, Span { line, col }));
-                chars.next();
-            }
-            '}' => {
-                tokens.push((Token::RBrace, Span { line, col }));
-                chars.next();
-            }
-            '[' => {
-                tokens.push((Token::LBracket, Span { line, col }));
-                chars.next();
-            }
-            ']' => {
-                tokens.push((Token::RBracket, Span { line, col }));
-                chars.next();
-            }
-            ',' => {
-                tokens.push((Token::Comma, Span { line, col }));
-                chars.next();
-            }
-            // String literals
-            '"' => {
-                let span = Span { line, col };
-                chars.next(); // consume opening quote
-                let mut s = String::new();
-                let mut closed = false;
-                while let Some(&(_, c)) = chars.peek() {
-                    chars.next();
-                    if c == '\\' {
-                        // Escape sequences
-                        if let Some(&(_, esc)) = chars.peek() {
-                            chars.next();
-                            match esc {
-                                'n' => s.push('\n'),
-                                't' => s.push('\t'),
-                                '\\' => s.push('\\'),
-                                '"' => s.push('"'),
-                                other => {
-                                    s.push('\\');
-                                    s.push(other);
-                                }
-                            }
-                        }
-                    } else if c == '"' {
-                        closed = true;
-                        break;
-                    } else {
-                        s.push(c);
-                    }
-                }
-                if !closed {
-                    return Err(ParseError::UnterminatedString { span });
-                }
-                tokens.push((Token::StringLit(s), span));
-            }
-            // Integers
-            c if c.is_ascii_digit() => {
-                let span = Span { line, col };
-                let mut num = String::new();
-                while let Some(&(_, c)) = chars.peek() {
-                    if c.is_ascii_digit() {
-                        num.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                let value: i64 = num.parse().map_err(|_| ParseError::InvalidInt {
-                    value: num,
-                    span: span.clone(),
-                })?;
-                tokens.push((Token::IntLit(value), span));
-            }
-            // Identifiers and keywords
-            c if c.is_ascii_alphabetic() || c == '_' => {
-                let span = Span { line, col };
-                let mut ident = String::new();
-                while let Some(&(_, c)) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                        ident.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                tokens.push((Token::Ident(ident), span));
-            }
-            _ => {
-                return Err(ParseError::UnexpectedChar {
-                    ch,
-                    span: Span { line, col },
-                });
-            }
+        // --- whitespace ---
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            pos += 1;
+            col += 1;
+            continue;
         }
+        if b == b'\n' {
+            pos += 1;
+            line += 1;
+            col = 1;
+            continue;
+        }
+
+        // --- comment ---
+        if b == b'#' {
+            while pos < len && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+
+        // --- single-character tokens ---
+        let span = Span::new(line, col);
+        match b {
+            b'{' => {
+                tokens.push((Token::LBrace, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            b'}' => {
+                tokens.push((Token::RBrace, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            b'[' => {
+                tokens.push((Token::LBracket, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            b']' => {
+                tokens.push((Token::RBracket, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            b'=' => {
+                tokens.push((Token::Equals, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            b',' => {
+                tokens.push((Token::Comma, span));
+                pos += 1;
+                col += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // --- string literal ---
+        if b == b'"' {
+            let start_span = Span::new(line, col);
+            pos += 1;
+            col += 1;
+            let mut value = String::new();
+            loop {
+                if pos >= len {
+                    return Err(ParseError::UnterminatedString { span: start_span });
+                }
+                let c = bytes[pos];
+                if c == b'"' {
+                    pos += 1;
+                    col += 1;
+                    break;
+                }
+                if c == b'\\' {
+                    pos += 1;
+                    col += 1;
+                    if pos >= len {
+                        return Err(ParseError::UnterminatedString { span: start_span });
+                    }
+                    let esc = bytes[pos];
+                    let resolved = match esc {
+                        b'n' => '\n',
+                        b't' => '\t',
+                        b'r' => '\r',
+                        b'\\' => '\\',
+                        b'"' => '"',
+                        _ => {
+                            // Keep the literal character after the backslash.
+                            esc as char
+                        }
+                    };
+                    value.push(resolved);
+                    pos += 1;
+                    col += 1;
+                    continue;
+                }
+                if c == b'\n' {
+                    // Newline inside a string — allow it but track position.
+                    value.push('\n');
+                    pos += 1;
+                    line += 1;
+                    col = 1;
+                    continue;
+                }
+                value.push(c as char);
+                pos += 1;
+                col += 1;
+            }
+            tokens.push((Token::StringLit(value), start_span));
+            continue;
+        }
+
+        // --- integer literal ---
+        if b.is_ascii_digit() {
+            let start_col = col;
+            let start_pos = pos;
+            while pos < len && bytes[pos].is_ascii_digit() {
+                pos += 1;
+                col += 1;
+            }
+            let text = &input[start_pos..pos];
+            let n: i64 = text.parse().map_err(|_| ParseError::InvalidInt {
+                text: text.to_owned(),
+                span: Span::new(line, start_col),
+            })?;
+            tokens.push((Token::IntLit(n), Span::new(line, start_col)));
+            continue;
+        }
+
+        // --- identifier / bareword ---
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start_col = col;
+            let start_pos = pos;
+            while pos < len
+                && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'-')
+            {
+                pos += 1;
+                col += 1;
+            }
+            let word = input[start_pos..pos].to_owned();
+            tokens.push((Token::Ident(word), Span::new(line, start_col)));
+            continue;
+        }
+
+        // --- unknown ---
+        return Err(ParseError::UnexpectedChar {
+            ch: b as char,
+            span: Span::new(line, col),
+        });
     }
 
-    tokens.push((Token::Eof, Span { line, col: 1 }));
+    tokens.push((Token::Eof, Span::new(line, col)));
     Ok(tokens)
 }
 
@@ -182,62 +216,124 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_simple_tokens() {
-        let tokens = tokenize("cell { }").unwrap();
-        assert_eq!(tokens[0].0, Token::Ident("cell".into()));
-        assert_eq!(tokens[1].0, Token::LBrace);
-        assert_eq!(tokens[2].0, Token::RBrace);
-        assert_eq!(tokens[3].0, Token::Eof);
+    fn empty_input() {
+        let tokens = tokenize("").unwrap();
+        assert_eq!(tokens, vec![(Token::Eof, Span::new(1, 1))]);
     }
 
     #[test]
-    fn test_string_literal() {
-        let tokens = tokenize(r#"name = "hello""#).unwrap();
-        assert_eq!(tokens[0].0, Token::Ident("name".into()));
-        assert_eq!(tokens[1].0, Token::Equals);
-        assert_eq!(tokens[2].0, Token::StringLit("hello".into()));
+    fn single_braces() {
+        let tokens = tokenize("{ }").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::LBrace, Span::new(1, 1)),
+                (Token::RBrace, Span::new(1, 3)),
+                (Token::Eof, Span::new(1, 4)),
+            ]
+        );
     }
 
     #[test]
-    fn test_integer_array() {
-        let tokens = tokenize("[8080, 3000]").unwrap();
-        assert_eq!(tokens[0].0, Token::LBracket);
-        assert_eq!(tokens[1].0, Token::IntLit(8080));
-        assert_eq!(tokens[2].0, Token::Comma);
-        assert_eq!(tokens[3].0, Token::IntLit(3000));
-        assert_eq!(tokens[4].0, Token::RBracket);
+    fn identifiers_and_equals() {
+        let tokens = tokenize("name = foo").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::Ident("name".into()), Span::new(1, 1)),
+                (Token::Equals, Span::new(1, 6)),
+                (Token::Ident("foo".into()), Span::new(1, 8)),
+                (Token::Eof, Span::new(1, 11)),
+            ]
+        );
     }
 
     #[test]
-    fn test_comments_stripped() {
-        let tokens = tokenize("# this is a comment\ncell").unwrap();
-        assert_eq!(tokens[0].0, Token::Ident("cell".into()));
-        assert_eq!(tokens[1].0, Token::Eof);
-    }
-
-    #[test]
-    fn test_escape_sequences() {
+    fn string_literal_with_escapes() {
         let tokens = tokenize(r#""hello\nworld""#).unwrap();
-        assert_eq!(tokens[0].0, Token::StringLit("hello\nworld".into()));
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::StringLit("hello\nworld".into()), Span::new(1, 1)),
+                (Token::Eof, Span::new(1, 15)),
+            ]
+        );
     }
 
     #[test]
-    fn test_unterminated_string() {
-        let result = tokenize(r#""hello"#);
-        assert!(result.is_err());
+    fn integer_literal() {
+        let tokens = tokenize("8080").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::IntLit(8080), Span::new(1, 1)),
+                (Token::Eof, Span::new(1, 5)),
+            ]
+        );
     }
 
     #[test]
-    fn test_span_tracking() {
-        let tokens = tokenize("cell {\n  name\n}").unwrap();
-        assert_eq!(tokens[0].1, Span { line: 1, col: 1 });
-        assert_eq!(tokens[2].1, Span { line: 2, col: 3 }); // "name"
-        assert_eq!(tokens[3].1, Span { line: 3, col: 1 }); // "}"
+    fn comment_is_skipped() {
+        let tokens = tokenize("# this is a comment\nfoo").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::Ident("foo".into()), Span::new(2, 1)),
+                (Token::Eof, Span::new(2, 4)),
+            ]
+        );
     }
 
     #[test]
-    fn test_hyphenated_ident() {
-        let tokens = tokenize("NODE_ENV").unwrap();
-        assert_eq!(tokens[0].0, Token::Ident("NODE_ENV".into()));
+    fn brackets_and_commas() {
+        let tokens = tokenize("[8080, 443]").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::LBracket, Span::new(1, 1)),
+                (Token::IntLit(8080), Span::new(1, 2)),
+                (Token::Comma, Span::new(1, 6)),
+                (Token::IntLit(443), Span::new(1, 8)),
+                (Token::RBracket, Span::new(1, 11)),
+                (Token::Eof, Span::new(1, 12)),
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_string() {
+        let err = tokenize("\"oops").unwrap_err();
+        assert!(matches!(err, ParseError::UnterminatedString { .. }));
+    }
+
+    #[test]
+    fn unexpected_char() {
+        let err = tokenize("@").unwrap_err();
+        assert!(matches!(err, ParseError::UnexpectedChar { ch: '@', .. }));
+    }
+
+    #[test]
+    fn multiline_tracking() {
+        let tokens = tokenize("a\nb").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::Ident("a".into()), Span::new(1, 1)),
+                (Token::Ident("b".into()), Span::new(2, 1)),
+                (Token::Eof, Span::new(2, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn hyphenated_ident() {
+        let tokens = tokenize("my-app").unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                (Token::Ident("my-app".into()), Span::new(1, 1)),
+                (Token::Eof, Span::new(1, 7)),
+            ]
+        );
     }
 }

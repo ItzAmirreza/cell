@@ -1,69 +1,71 @@
-use anyhow::Result;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+
 use cell_store::{ContainerStatus, ContainerStore};
-use colored::Colorize;
 
 use super::cell_home;
 
-pub fn execute(id: &str) -> Result<()> {
-    let containers = ContainerStore::new(cell_home().join("containers"));
-    let mut state = containers.get(id)?;
-    let json_mode = super::is_json();
+pub fn stop(id: &str) -> Result<()> {
+    let home = cell_home();
+    let store = ContainerStore::with_root(home)?;
 
-    if let Some(pid) = state.pid {
-        if json_mode {
-            eprintln!("Stopping container {} (PID {})...", state.id, pid);
-        } else {
-            println!("Stopping container {} (PID {})...", state.id.bold(), pid);
+    let mut state = store
+        .get(id)
+        .with_context(|| format!("container not found: {id}"))?;
+
+    let pid = match state.pid {
+        Some(p) => p,
+        None => bail!("container {} is not running", state.id),
+    };
+
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+
+    // Send SIGTERM for graceful shutdown.
+    println!("Sending SIGTERM to container {} (pid {})...", &state.id[..8], pid);
+    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
+
+    // Wait up to 5 seconds for the process to exit.
+    let mut exited = false;
+    for _ in 0..50 {
+        match nix::sys::wait::waitpid(nix_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::Exited(..)) | Ok(nix::sys::wait::WaitStatus::Signaled(..)) => {
+                exited = true;
+                break;
+            }
+            Err(nix::errno::Errno::ECHILD) => {
+                // Process already gone.
+                exited = true;
+                break;
+            }
+            _ => {}
         }
-        kill_pid(pid);
-    } else if !json_mode {
-        println!(
-            "{}: container {} has no PID, marking as stopped",
-            "note".yellow(),
-            state.id.bold()
-        );
+
+        // Also check if the process still exists via kill(0).
+        if nix::sys::signal::kill(nix_pid, None).is_err() {
+            exited = true;
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    if !exited {
+        // Force kill after timeout.
+        println!("Process did not exit, sending SIGKILL...");
+        let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
+        // Reap the zombie.
+        let _ = nix::sys::wait::waitpid(nix_pid, None);
     }
 
     state.status = ContainerStatus::Stopped;
     state.pid = None;
-    containers.save(&state)?;
 
-    if json_mode {
-        println!(
-            "{}",
-            serde_json::to_string(&serde_json::json!({
-                "id": state.id,
-                "status": "stopped"
-            }))?
-        );
-    } else {
-        println!("Container {} {}", state.id.bold(), "stopped".green());
-    }
+    store
+        .update(&state)
+        .with_context(|| format!("failed to update container {}", state.id))?;
+
+    println!("Stopped container {}", state.id);
     Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn kill_pid(pid: u32) {
-    use std::ffi::c_void;
-
-    const PROCESS_TERMINATE: u32 = 0x0001;
-
-    extern "system" {
-        fn OpenProcess(dw_desired_access: u32, b_inherit_handle: i32, dw_process_id: u32) -> *mut c_void;
-        fn TerminateProcess(h_process: *mut c_void, u_exit_code: u32) -> i32;
-        fn CloseHandle(h_object: *mut c_void) -> i32;
-    }
-
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if !handle.is_null() {
-            TerminateProcess(handle, 1);
-            CloseHandle(handle);
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn kill_pid(_pid: u32) {
-    // Non-Windows: not implemented (cell targets Windows).
 }

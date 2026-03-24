@@ -5,132 +5,117 @@ use anyhow::{Context, Result};
 
 use crate::hash::sha256_digest;
 
-/// Content-addressed blob storage.
+/// Content-addressed blob store backed by a flat directory.
 ///
-/// Blobs are stored by their SHA-256 digest under a flat directory.
-/// Duplicate writes are automatically deduplicated.
+/// Each blob is stored as a file whose name equals its digest (`sha256-{hex}`).
 pub struct BlobStore {
     root: PathBuf,
 }
 
 impl BlobStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// Create a new `BlobStore`, ensuring the root directory exists.
+    pub fn new(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create blob store at {}", root.display()))?;
+        Ok(Self { root })
     }
 
-    /// Ensure the storage directory exists.
-    pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create blob store at {:?}", self.root))
-    }
-
-    /// Store `data` and return its digest. No-op if the blob already exists.
+    /// Store `data` and return its digest.
+    ///
+    /// The write is atomic: data is first written to a temporary file, then
+    /// renamed into place.  If a blob with the same digest already exists the
+    /// write is skipped (content-addressed dedup).
     pub fn put(&self, data: &[u8]) -> Result<String> {
-        self.init()?;
         let digest = sha256_digest(data);
-        let path = self.root.join(&digest);
+        let dest = self.root.join(&digest);
 
-        if path.exists() {
+        if dest.exists() {
             return Ok(digest);
         }
 
-        // Write to a temp file first, then rename for atomic write.
-        let tmp_path = self.root.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-        fs::write(&tmp_path, data)
-            .with_context(|| format!("failed to write temp blob {:?}", tmp_path))?;
-        fs::rename(&tmp_path, &path)
-            .with_context(|| format!("failed to rename blob to {:?}", path))?;
+        let tmp = self.root.join(format!("{}.tmp", digest));
+        fs::write(&tmp, data)
+            .with_context(|| format!("failed to write temp blob {}", tmp.display()))?;
+        fs::rename(&tmp, &dest)
+            .with_context(|| format!("failed to rename blob into place {}", dest.display()))?;
 
         Ok(digest)
     }
 
-    /// Retrieve the contents of a blob by digest.
+    /// Read the blob identified by `digest`.
     pub fn get(&self, digest: &str) -> Result<Vec<u8>> {
         let path = self.root.join(digest);
         fs::read(&path).with_context(|| format!("blob not found: {digest}"))
     }
 
-    /// Check if a blob exists.
+    /// Check whether a blob with the given digest exists.
     pub fn exists(&self, digest: &str) -> bool {
         self.root.join(digest).exists()
     }
 
-    /// List all blob digests in the store.
+    /// List the digests of every blob in the store.
     pub fn list(&self) -> Result<Vec<String>> {
-        self.init()?;
         let mut digests = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        for entry in fs::read_dir(&self.root).context("failed to list blob store")? {
             let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             if name.starts_with("sha256-") {
-                digests.push(name);
+                digests.push(name.into_owned());
             }
         }
         digests.sort();
         Ok(digests)
-    }
-
-    /// Remove a blob by digest.
-    pub fn remove(&self, digest: &str) -> Result<()> {
-        let path = self.root.join(digest);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    fn tmp_store() -> (tempfile::TempDir, BlobStore) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = BlobStore::new(tmp.path().join("blobs"));
-        (tmp, store)
+    fn store() -> (BlobStore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = BlobStore::new(tmp.path().join("blobs")).unwrap();
+        (store, tmp)
     }
 
     #[test]
-    fn test_put_and_get() {
-        let (_tmp, store) = tmp_store();
-        let data = b"hello world";
-        let digest = store.put(data).unwrap();
+    fn put_and_get() {
+        let (s, _tmp) = store();
+        let digest = s.put(b"hello").unwrap();
         assert!(digest.starts_with("sha256-"));
-        let retrieved = store.get(&digest).unwrap();
-        assert_eq!(retrieved, data);
+        assert_eq!(s.get(&digest).unwrap(), b"hello");
     }
 
     #[test]
-    fn test_deduplication() {
-        let (_tmp, store) = tmp_store();
-        let d1 = store.put(b"same").unwrap();
-        let d2 = store.put(b"same").unwrap();
+    fn dedup() {
+        let (s, _tmp) = store();
+        let d1 = s.put(b"same").unwrap();
+        let d2 = s.put(b"same").unwrap();
         assert_eq!(d1, d2);
     }
 
     #[test]
-    fn test_exists() {
-        let (_tmp, store) = tmp_store();
-        let digest = store.put(b"data").unwrap();
-        assert!(store.exists(&digest));
-        assert!(!store.exists("sha256-nonexistent"));
+    fn exists_and_missing() {
+        let (s, _tmp) = store();
+        let d = s.put(b"data").unwrap();
+        assert!(s.exists(&d));
+        assert!(!s.exists("sha256-0000"));
     }
 
     #[test]
-    fn test_list() {
-        let (_tmp, store) = tmp_store();
-        store.put(b"aaa").unwrap();
-        store.put(b"bbb").unwrap();
-        let list = store.list().unwrap();
-        assert_eq!(list.len(), 2);
+    fn list_blobs() {
+        let (s, _tmp) = store();
+        s.put(b"aaa").unwrap();
+        s.put(b"bbb").unwrap();
+        let digests = s.list().unwrap();
+        assert_eq!(digests.len(), 2);
     }
 
     #[test]
-    fn test_remove() {
-        let (_tmp, store) = tmp_store();
-        let digest = store.put(b"removeme").unwrap();
-        assert!(store.exists(&digest));
-        store.remove(&digest).unwrap();
-        assert!(!store.exists(&digest));
+    fn get_missing_returns_error() {
+        let (s, _tmp) = store();
+        assert!(s.get("sha256-nonexistent").is_err());
     }
 }

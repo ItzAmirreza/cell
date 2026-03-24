@@ -4,53 +4,60 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use cell_format::ImageManifest;
 
-/// Storage for image manifests, organized by name.
+/// Stores image manifests on disk, one directory per image name.
+///
+/// Layout:
+/// ```text
+/// <root>/
+///   <name>/
+///     manifest.json
+/// ```
 pub struct ImageStore {
     root: PathBuf,
 }
 
 impl ImageStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// Create a new `ImageStore`, ensuring the root directory exists.
+    pub fn new(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create image store at {}", root.display()))?;
+        Ok(Self { root })
     }
 
-    /// Ensure the storage directory exists.
-    pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create image store at {:?}", self.root))
-    }
-
-    /// Save an image manifest. Overwrites if the image name already exists.
+    /// Persist an `ImageManifest`.  The file is written to
+    /// `<root>/<manifest.name>/manifest.json`.
     pub fn save(&self, manifest: &ImageManifest) -> Result<()> {
-        self.init()?;
         let dir = self.root.join(&manifest.name);
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create image dir {}", dir.display()))?;
+
         let path = dir.join("manifest.json");
-        let json = serde_json::to_string_pretty(manifest)?;
+        let json = serde_json::to_string_pretty(manifest).context("failed to serialize manifest")?;
         fs::write(&path, json)
-            .with_context(|| format!("failed to write manifest for '{}'", manifest.name))
+            .with_context(|| format!("failed to write manifest {}", path.display()))?;
+
+        Ok(())
     }
 
-    /// Load an image manifest by name.
+    /// Load an `ImageManifest` by image name.
     pub fn load(&self, name: &str) -> Result<ImageManifest> {
         let path = self.root.join(name).join("manifest.json");
-        let json =
-            fs::read_to_string(&path).with_context(|| format!("image not found: '{name}'"))?;
-        let manifest: ImageManifest = serde_json::from_str(&json)?;
+        let data =
+            fs::read_to_string(&path).with_context(|| format!("image not found: {name}"))?;
+        let manifest: ImageManifest =
+            serde_json::from_str(&data).context("failed to parse manifest")?;
         Ok(manifest)
     }
 
-    /// List all image names in the store.
+    /// List the names of all stored images.
     pub fn list(&self) -> Result<Vec<String>> {
-        self.init()?;
         let mut names = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
+        for entry in fs::read_dir(&self.root).context("failed to list image store")? {
             let entry = entry?;
-            if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // Only include dirs that contain a manifest
-                if entry.path().join("manifest.json").exists() {
-                    names.push(name);
+            if entry.file_type()?.is_dir() {
+                let manifest_path = entry.path().join("manifest.json");
+                if manifest_path.exists() {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
                 }
             }
         }
@@ -58,12 +65,11 @@ impl ImageStore {
         Ok(names)
     }
 
-    /// Remove an image by name.
+    /// Remove an image and its directory.
     pub fn remove(&self, name: &str) -> Result<()> {
         let dir = self.root.join(name);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
+        fs::remove_dir_all(&dir)
+            .with_context(|| format!("failed to remove image: {name}"))?;
         Ok(())
     }
 }
@@ -72,51 +78,71 @@ impl ImageStore {
 mod tests {
     use super::*;
     use cell_format::{ImageConfig, ImageManifest};
+    use tempfile::TempDir;
 
     fn test_manifest(name: &str) -> ImageManifest {
         ImageManifest {
             name: name.to_string(),
-            created_at: "2026-03-23T00:00:00Z".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
             config: ImageConfig {
                 env: vec![],
-                entrypoint: Some("/bin/sh".into()),
+                entrypoint: Some(vec!["/bin/sh".to_string()]),
                 exposed_ports: vec![],
                 workdir: None,
             },
             layers: vec![],
-            limits: None,
-            ports: vec![],
-            volumes: vec![],
         }
     }
 
-    #[test]
-    fn test_save_and_load() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ImageStore::new(tmp.path().join("images"));
-        let manifest = test_manifest("myapp");
-        store.save(&manifest).unwrap();
-        let loaded = store.load("myapp").unwrap();
-        assert_eq!(loaded.name, "myapp");
-        assert_eq!(loaded.config.entrypoint.as_deref(), Some("/bin/sh"));
+    fn store() -> (ImageStore, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path().join("images")).unwrap();
+        (store, tmp)
     }
 
     #[test]
-    fn test_list() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ImageStore::new(tmp.path().join("images"));
-        store.save(&test_manifest("alpha")).unwrap();
-        store.save(&test_manifest("beta")).unwrap();
-        let list = store.list().unwrap();
-        assert_eq!(list, vec!["alpha", "beta"]);
+    fn save_and_load() {
+        let (s, _tmp) = store();
+        let m = test_manifest("myimg");
+        s.save(&m).unwrap();
+        let loaded = s.load("myimg").unwrap();
+        assert_eq!(loaded, m);
     }
 
     #[test]
-    fn test_remove() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = ImageStore::new(tmp.path().join("images"));
-        store.save(&test_manifest("gone")).unwrap();
-        store.remove("gone").unwrap();
-        assert!(store.load("gone").is_err());
+    fn list_images() {
+        let (s, _tmp) = store();
+        s.save(&test_manifest("alpha")).unwrap();
+        s.save(&test_manifest("beta")).unwrap();
+        let names = s.list().unwrap();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn remove_image() {
+        let (s, _tmp) = store();
+        s.save(&test_manifest("gone")).unwrap();
+        assert!(s.load("gone").is_ok());
+        s.remove("gone").unwrap();
+        assert!(s.load("gone").is_err());
+    }
+
+    #[test]
+    fn load_missing_returns_error() {
+        let (s, _tmp) = store();
+        assert!(s.load("nope").is_err());
+    }
+
+    #[test]
+    fn save_overwrites() {
+        let (s, _tmp) = store();
+        let mut m = test_manifest("img");
+        s.save(&m).unwrap();
+
+        m.created_at = "2026-06-01T00:00:00Z".to_string();
+        s.save(&m).unwrap();
+
+        let loaded = s.load("img").unwrap();
+        assert_eq!(loaded.created_at, "2026-06-01T00:00:00Z");
     }
 }
