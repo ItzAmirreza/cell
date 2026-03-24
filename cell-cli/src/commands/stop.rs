@@ -20,43 +20,13 @@ pub fn stop(id: &str) -> Result<()> {
         None => bail!("container {} is not running", state.id),
     };
 
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
-
-    // Send SIGTERM for graceful shutdown.
     println!("Sending SIGTERM to container {} (pid {})...", &state.id[..8], pid);
-    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
 
-    // Wait up to 5 seconds for the process to exit.
-    let mut exited = false;
-    for _ in 0..50 {
-        match nix::sys::wait::waitpid(nix_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-            Ok(nix::sys::wait::WaitStatus::Exited(..)) | Ok(nix::sys::wait::WaitStatus::Signaled(..)) => {
-                exited = true;
-                break;
-            }
-            Err(nix::errno::Errno::ECHILD) => {
-                // Process already gone.
-                exited = true;
-                break;
-            }
-            _ => {}
-        }
-
-        // Also check if the process still exists via kill(0).
-        if nix::sys::signal::kill(nix_pid, None).is_err() {
-            exited = true;
-            break;
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
+    let exited = platform_stop(pid);
 
     if !exited {
-        // Force kill after timeout.
         println!("Process did not exit, sending SIGKILL...");
-        let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
-        // Reap the zombie.
-        let _ = nix::sys::wait::waitpid(nix_pid, None);
+        platform_kill(pid);
     }
 
     state.status = ContainerStatus::Stopped;
@@ -69,3 +39,62 @@ pub fn stop(id: &str) -> Result<()> {
     println!("Stopped container {}", state.id);
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn platform_stop(pid: u32) -> bool {
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
+
+    for _ in 0..50 {
+        match nix::sys::wait::waitpid(nix_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::Exited(..))
+            | Ok(nix::sys::wait::WaitStatus::Signaled(..)) => return true,
+            Err(nix::errno::Errno::ECHILD) => return true,
+            _ => {}
+        }
+        if nix::sys::signal::kill(nix_pid, None).is_err() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn platform_kill(pid: u32) {
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
+    let _ = nix::sys::wait::waitpid(nix_pid, None);
+}
+
+#[cfg(target_os = "windows")]
+fn platform_stop(pid: u32) -> bool {
+    // On Windows, use TerminateProcess via the windows crate
+    // For now, just mark as stopped — the Job Object's KILL_ON_JOB_CLOSE handles cleanup
+    unsafe {
+        let handle = windows::Win32::System::Threading::OpenProcess(
+            windows::Win32::System::Threading::PROCESS_TERMINATE,
+            false,
+            pid,
+        );
+        if let Ok(handle) = handle {
+            let _ = windows::Win32::System::Threading::TerminateProcess(handle, 1);
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn platform_kill(pid: u32) {
+    platform_stop(pid);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_stop(_pid: u32) -> bool {
+    eprintln!("stop not implemented on this platform");
+    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn platform_kill(_pid: u32) {}

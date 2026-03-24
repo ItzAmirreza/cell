@@ -143,6 +143,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "windows",
 ]
 
 [[package]]
